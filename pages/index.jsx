@@ -1,456 +1,73 @@
-import React, { useState, useEffect } from 'react';
-import { calculateFreeSlots } from '../utils/scheduler';
-import {
-  CalendarDays, CheckCircle, Clock, AlertTriangle,
-  Plus, Trash2, Calendar
-} from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CalendarDays, CheckCircle, CheckSquare, Plus, Trash2, X } from 'lucide-react';
+import { calculateFreeSlots, getLocalDateStr, minsToTime, timeToMins, validateAvailabilityWindows } from '../utils/scheduler';
+
+const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const DEFAULTS = Object.fromEntries(DAYS.map((day, index) => [day, index < 5 ? [{ start: '09:00', end: '17:00' }] : []]));
+const taskDefaults = () => ({ title: '', duration: 60, priority: 'Medium', deadline: getLocalDateStr() });
+const eventDefaults = () => ({ title: '', date: getLocalDateStr(), startTime: '09:00', endTime: '10:00' });
+
+function Dialog({ title, close, children }) {
+  useEffect(() => { const handler = event => event.key === 'Escape' && close(); document.addEventListener('keydown', handler); return () => document.removeEventListener('keydown', handler); }, [close]);
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"><div role="dialog" aria-modal="true" className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl"><div className="mb-4 flex justify-between"><h2 className="text-lg font-bold">{title}</h2><button onClick={close} aria-label="Close dialog"><X /></button></div>{children}</div></div>;
+}
 
 export default function SmartScheduler() {
-  const [isMounted, setIsMounted] = useState(false);
-  const [activeTab, setActiveTab] = useState('dashboard');
-
-  // --- Global App State ---
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState('dashboard');
   const [tasks, setTasks] = useState([]);
   const [events, setEvents] = useState([]);
-  const [availability, setAvailability] = useState({
-    Monday: [{ start: '09:00', end: '17:00' }],
-    Tuesday: [{ start: '09:00', end: '17:00' }],
-    Wednesday: [{ start: '09:00', end: '17:00' }],
-    Thursday: [{ start: '09:00', end: '17:00' }],
-    Friday: [{ start: '09:00', end: '17:00' }],
-    Saturday: [],
-    Sunday: []
-  });
-
-  // --- Form States ---
-  const [newTask, setNewTask] = useState({ title: '', duration: 60, priority: 'Medium', deadline: '' });
-  const [newEvent, setNewEvent] = useState({ title: '', date: '', startTime: '', endTime: '' });
-
-  // --- AI Scheduling UI State ---
-  const [aiLoading, setAiLoading] = useState(false);
+  const [availability, setAvailability] = useState(DEFAULTS);
+  const [taskForm, setTaskForm] = useState(taskDefaults);
+  const [eventForm, setEventForm] = useState(eventDefaults);
+  const [availabilityForm, setAvailabilityForm] = useState(DEFAULTS);
+  const [editing, setEditing] = useState(false);
+  const [dialog, setDialog] = useState(null);
+  const [notice, setNotice] = useState('');
+  const [target, setTarget] = useState(null);
   const [recommendation, setRecommendation] = useState(null);
-  const [targetTask, setTargetTask] = useState(null);
+  const [loading, setLoading] = useState(false);
 
-  // --- Hydration & Persistence ---
   useEffect(() => {
-    setIsMounted(true);
-    const savedTasks = localStorage.getItem('smart_tasks');
-    const savedEvents = localStorage.getItem('smart_events');
-    const savedAvail = localStorage.getItem('smart_availability');
-
-    if (savedTasks) setTasks(JSON.parse(savedTasks));
-    if (savedEvents) setEvents(JSON.parse(savedEvents));
-    if (savedAvail) setAvailability(JSON.parse(savedAvail));
+    setReady(true);
+    try {
+      setTasks(JSON.parse(localStorage.getItem('smart_tasks') || '[]'));
+      setEvents(JSON.parse(localStorage.getItem('smart_events') || '[]'));
+      const saved = JSON.parse(localStorage.getItem('smart_availability') || 'null');
+      if (saved) { const normalized = Object.fromEntries(DAYS.map(day => [day, saved[day] || []])); setAvailability(normalized); setAvailabilityForm(normalized); }
+    } catch { setNotice('Saved data could not be loaded.'); }
   }, []);
 
   useEffect(() => {
-    if (isMounted) {
-      localStorage.setItem('smart_tasks', JSON.stringify(tasks));
-      localStorage.setItem('smart_events', JSON.stringify(events));
-      localStorage.setItem('smart_availability', JSON.stringify(availability));
-    }
-  }, [tasks, events, availability, isMounted]);
+    if (!ready) return;
+    localStorage.setItem('smart_tasks', JSON.stringify(tasks));
+    localStorage.setItem('smart_events', JSON.stringify(events));
+    localStorage.setItem('smart_availability', JSON.stringify(availability));
+  }, [ready, tasks, events, availability]);
 
-  if (!isMounted) return <div className="min-h-screen bg-slate-50 flex items-center justify-center font-sans text-slate-500">Loading Scheduler...</div>;
+  if (!ready) return <div className="flex min-h-screen items-center justify-center bg-slate-50">Loading Scheduler...</div>;
+  const today = getLocalDateStr();
+  const active = tasks.filter(task => task.status !== 'Completed');
+  const completed = tasks.filter(task => task.status === 'Completed');
+  const overdue = active.filter(task => task.scheduledDate && task.scheduledDate < today);
+  const notify = text => { setNotice(text); setTimeout(() => setNotice(''), 3000); };
 
-  // --- Action Handlers ---
-  const addTask = (e) => {
-    e.preventDefault();
-    if (!newTask.title) return;
-    setTasks([...tasks, { ...newTask, id: Date.now().toString(), status: 'Pending', scheduledStart: null }]);
-    setNewTask({ title: '', duration: 60, priority: 'Medium', deadline: '' });
-  };
+  const addTask = event => { event.preventDefault(); const duration = Number(taskForm.duration); if (!taskForm.title.trim() || !Number.isFinite(duration) || duration < 5 || !taskForm.deadline) return notify('Enter a title, valid duration, and deadline.'); setDialog('add'); };
+  const confirmTask = () => { setTasks(current => [...current, { ...taskForm, title: taskForm.title.trim(), duration: Number(taskForm.duration), id: `${Date.now()}-${Math.random()}`, status: 'Pending', scheduledDate: null, scheduledStart: null, scheduledEnd: null }]); setTaskForm(taskDefaults()); setDialog(null); notify('Task added.'); };
+  const addEvent = event => { event.preventDefault(); if (!eventForm.title.trim() || timeToMins(eventForm.startTime) >= timeToMins(eventForm.endTime)) return notify('Event end must be after its start.'); setEvents(current => [...current, { ...eventForm, title: eventForm.title.trim(), id: `${Date.now()}-${Math.random()}` }]); setEventForm(eventDefaults()); notify('Event added.'); };
+  const completeTask = () => { setTasks(current => current.map(task => task.id === dialog.task.id ? { ...task, status: 'Completed', completedAt: new Date().toISOString() } : task)); setDialog(null); notify('Task completed.'); };
+  const reschedule = () => { let next = [...tasks]; let count = 0; [...overdue].sort((a, b) => ({ High: 1, Medium: 2, Low: 3 }[a.priority] - { High: 1, Medium: 2, Low: 3 }[b.priority])).forEach(task => { if (task.deadline && task.deadline < today) return; const slot = calculateFreeSlots(today, task.duration, availability, events, next)[0]; if (!slot) return; next = next.map(item => item.id === task.id ? { ...item, scheduledDate: today, scheduledStart: slot.start, scheduledEnd: minsToTime(timeToMins(slot.start) + Number(task.duration)) } : item); count += 1; }); setTasks(next); setDialog(null); notify(`${count} task(s) rescheduled to today.`); };
+  const schedule = async task => { setTarget(task); setLoading(true); const dates = Array.from({ length: 4 }, (_, index) => { const date = new Date(); date.setDate(date.getDate() + index); return getLocalDateStr(date); }); const slots = dates.flatMap(date => calculateFreeSlots(date, task.duration, availability, events, tasks)); try { const response = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task, availableSlots: slots, existingEvents: events, existingTasks: tasks }) }); setRecommendation(await response.json()); } catch { setRecommendation({ reason: 'Scheduling is unavailable.' }); } finally { setLoading(false); } };
+  const acceptSchedule = () => { if (!recommendation?.recommendedStart || !target) return; const [date, start] = recommendation.recommendedStart.split('T'); const end = recommendation.recommendedEnd.split('T')[1]; const valid = calculateFreeSlots(date, target.duration, availability, events, tasks).some(slot => timeToMins(start) >= timeToMins(slot.start) && timeToMins(end) <= timeToMins(slot.end)); if (!valid || (target.deadline && date > target.deadline)) return setRecommendation({ reason: 'This slot is no longer valid.' }); setTasks(current => current.map(task => task.id === target.id ? { ...task, scheduledDate: date, scheduledStart: start, scheduledEnd: end } : task)); setTarget(null); setRecommendation(null); notify('Task scheduled.'); };
+  const saveAvailability = () => { for (const day of DAYS) { const result = validateAvailabilityWindows(availabilityForm[day]); if (!result.valid) return notify(`${day}: ${result.error}`); } setAvailability(availabilityForm); setEditing(false); notify('Availability saved.'); };
+  const taskRow = task => <div key={task.id} className="flex justify-between gap-3 rounded border bg-white p-4"><div><b>{task.title}</b><p className="text-xs text-slate-500">{task.duration} mins | {task.priority} | Due {task.deadline || 'None'} {task.scheduledDate && `| ${task.scheduledDate} ${task.scheduledStart}-${task.scheduledEnd}`}</p></div><div className="flex gap-2"><button onClick={() => schedule(task)} className="rounded bg-indigo-100 px-2 py-1 text-xs text-indigo-700">Auto-Schedule</button><button onClick={() => setDialog({ type: 'complete', task })} aria-label={`Mark ${task.title} as completed`} className="text-green-600"><CheckSquare /></button><button onClick={() => setTasks(current => current.filter(item => item.id !== task.id))} aria-label={`Delete ${task.title}`} className="text-red-500"><Trash2 /></button></div></div>;
 
-  const addEvent = (e) => {
-    e.preventDefault();
-    if (!newEvent.title || !newEvent.date || !newEvent.startTime || !newEvent.endTime) return;
-    setEvents([...events, { ...newEvent, id: Date.now().toString() }]);
-    setNewEvent({ title: '', date: '', startTime: '', endTime: '' });
-  };
+  let content;
+  if (tab === 'dashboard') content = <><div className="grid grid-cols-2 gap-4 md:grid-cols-4">{[['Pending', active.length], ['Overdue', overdue.length], ['Completed', completed.length], ['Events today', events.filter(event => event.date === today).length]].map(([label, value]) => <div key={label} className="rounded border bg-white p-4"><span className="text-sm text-slate-500">{label}</span><b className="block text-2xl">{value}</b></div>)}</div>{overdue.length > 0 && <div className="rounded border border-orange-200 bg-orange-50 p-4">Overdue tasks need attention. <button onClick={() => setDialog('reschedule')} className="rounded bg-orange-600 px-3 py-2 text-sm text-white">Reschedule to Today</button></div>}<section className="rounded border bg-white p-5"><h2 className="mb-3 text-lg font-bold">Today's Schedule</h2>{events.filter(event => event.date === today).map(event => <p key={event.id} className="border-l-4 border-blue-500 p-2">{event.title}: {event.startTime}-{event.endTime}</p>)}{active.filter(task => task.scheduledDate === today).map(task => <p key={task.id} className="border-l-4 border-indigo-500 p-2">{task.title}: {task.scheduledStart}-{task.scheduledEnd}</p>)}</section></>;
+  if (tab === 'tasks') content = <><section className="rounded border bg-white p-5"><h2 className="mb-3 text-lg font-bold">Add New Task</h2><form onSubmit={addTask} className="grid gap-3 md:grid-cols-5"><input required placeholder="Task title" value={taskForm.title} onChange={event => setTaskForm({ ...taskForm, title: event.target.value })} className="rounded border p-2 md:col-span-2" /><input required type="number" min="5" value={taskForm.duration} onChange={event => setTaskForm({ ...taskForm, duration: event.target.value })} className="rounded border p-2" /><select value={taskForm.priority} onChange={event => setTaskForm({ ...taskForm, priority: event.target.value })} className="rounded border p-2"><option>High</option><option>Medium</option><option>Low</option></select><input required type="date" value={taskForm.deadline} onChange={event => setTaskForm({ ...taskForm, deadline: event.target.value })} className="rounded border p-2" /><button className="rounded bg-indigo-600 py-2 text-white md:col-span-5"><Plus className="mr-1 inline" />Add Task</button></form></section><section className="rounded border bg-white p-5"><h2 className="mb-3 text-lg font-bold">Active Tasks</h2><div className="space-y-3">{active.map(taskRow)}</div></section></>;
+  if (tab === 'events') content = <><section className="rounded border bg-white p-5"><h2 className="mb-3 text-lg font-bold">Add Fixed Event</h2><form onSubmit={addEvent} className="grid gap-3 md:grid-cols-4"><input required placeholder="Event title" value={eventForm.title} onChange={event => setEventForm({ ...eventForm, title: event.target.value })} className="rounded border p-2" /><input required type="date" value={eventForm.date} onChange={event => setEventForm({ ...eventForm, date: event.target.value })} className="rounded border p-2" /><input required type="time" value={eventForm.startTime} onChange={event => setEventForm({ ...eventForm, startTime: event.target.value })} className="rounded border p-2" /><input required type="time" value={eventForm.endTime} onChange={event => setEventForm({ ...eventForm, endTime: event.target.value })} className="rounded border p-2" /><button className="rounded bg-blue-600 py-2 text-white md:col-span-4">Add Event</button></form></section><section className="rounded border bg-white p-5">{events.map(event => <p key={event.id} className="flex justify-between border-b p-2">{event.title} | {event.date} {event.startTime}-{event.endTime}<button onClick={() => setEvents(current => current.filter(item => item.id !== event.id))} aria-label={`Delete ${event.title}`}><Trash2 className="text-red-500" /></button></p>)}</section></>;
+  if (tab === 'availability') content = <section className="rounded border bg-white p-5"><div className="mb-4 flex justify-between"><h2 className="text-lg font-bold">Working Hours</h2>{editing ? <div><button onClick={() => setEditing(false)} className="mr-2 rounded bg-slate-100 px-3 py-2">Cancel</button><button onClick={saveAvailability} className="rounded bg-indigo-600 px-3 py-2 text-white">Save</button></div> : <button onClick={() => { setAvailabilityForm(availability); setEditing(true); }} className="rounded bg-indigo-100 px-3 py-2">Edit Hours</button>}</div>{DAYS.map(day => <div key={day} className="mb-3 flex flex-wrap gap-3 border-b pb-3"><b className="w-24">{day}</b>{editing ? <div>{availabilityForm[day].map((window, index) => <div key={`${day}-${index}`} className="mb-2 flex gap-2"><input type="time" value={window.start} onChange={event => { const next = [...availabilityForm[day]]; next[index] = { ...next[index], start: event.target.value }; setAvailabilityForm({ ...availabilityForm, [day]: next }); }} className="rounded border p-2" /><input type="time" value={window.end} onChange={event => { const next = [...availabilityForm[day]]; next[index] = { ...next[index], end: event.target.value }; setAvailabilityForm({ ...availabilityForm, [day]: next }); }} className="rounded border p-2" /><button onClick={() => setAvailabilityForm({ ...availabilityForm, [day]: availabilityForm[day].filter((_, item) => item !== index) })} aria-label="Remove window"><Trash2 className="text-red-500" /></button></div>)}<button onClick={() => setAvailabilityForm({ ...availabilityForm, [day]: [...availabilityForm[day], { start: '09:00', end: '17:00' }] })} className="text-sm text-indigo-600">+ Add window</button></div> : <span>{availability[day].length ? availability[day].map(window => `${window.start}-${window.end}`).join(', ') : 'Unavailable'}</span>}</div>)}</section>;
+  if (tab === 'completed') content = <section className="rounded border bg-white p-5"><h2 className="mb-3 text-lg font-bold">Completed Tasks ({completed.length})</h2>{completed.map(task => <div key={task.id} className="mb-3 rounded bg-slate-50 p-3"><b className="line-through">{task.title}</b><p className="text-xs">{task.duration} mins | {task.priority} | Due {task.deadline || 'None'} | Completed {task.completedAt ? new Date(task.completedAt).toLocaleString() : 'Previously completed'}</p></div>)}</section>;
 
-  const deleteTask = (id) => setTasks(tasks.filter(t => t.id !== id));
-  const deleteEvent = (id) => setEvents(events.filter(e => e.id !== id));
-
-  const toggleTaskComplete = (id) => {
-    setTasks(tasks.map(t => t.id === id ? { ...t, status: t.status === 'Completed' ? 'Pending' : 'Completed' } : t));
-  };
-
-  // --- AI Scheduling Engine ---
-  const handleScheduleTask = async (task) => {
-    setAiLoading(true);
-    setTargetTask(task);
-    setRecommendation(null);
-
-    // Check for free slots over the next 4 days starting from today
-    const datesToCheck = Array.from({ length: 4 }, (_, i) => {
-      const d = new Date();
-      d.setDate(d.getDate() + i);
-      return d.toISOString().split('T')[0];
-    });
-
-    let computedSlots = [];
-    for (const date of datesToCheck) {
-      computedSlots.push(...calculateFreeSlots(date, task.duration, availability, events, tasks));
-    }
-
-    try {
-      const res = await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task, availableSlots: computedSlots, existingEvents: events, existingTasks: tasks })
-      });
-      const data = await res.json();
-      setRecommendation(data);
-    } catch (err) {
-      alert('Failed to fetch recommendation. Ensure your server is running.');
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
-  const acceptRecommendation = () => {
-    if (!recommendation || !recommendation.recommendedStart) return;
-
-    const [date, startTime] = recommendation.recommendedStart.split('T');
-    const endTime = recommendation.recommendedEnd.split('T')[1];
-
-    setTasks(tasks.map(t =>
-      t.id === targetTask.id
-        ? { ...t, scheduledDate: date, scheduledStart: startTime, scheduledEnd: endTime, status: 'Pending' }
-        : t
-    ));
-    setRecommendation(null);
-    setTargetTask(null);
-  };
-
-  // --- UI Helpers ---
-  const getPriorityColor = (priority) => {
-    if (priority === 'High') return 'text-red-600 bg-red-100';
-    if (priority === 'Medium') return 'text-orange-600 bg-orange-100';
-    return 'text-blue-600 bg-blue-100';
-  };
-
-  const todayStr = new Date().toISOString().split('T')[0];
-  const pendingTasks = tasks.filter(t => t.status === 'Pending');
-  const completedTasks = tasks.filter(t => t.status === 'Completed');
-  const todayEvents = events.filter(e => e.date === todayStr);
-
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
-      <nav className="bg-white shadow-sm border-b px-6 py-4 flex flex-col md:flex-row justify-between items-center gap-4">
-        <h1 className="text-xl font-bold text-indigo-600 flex items-center gap-2">
-          <CalendarDays className="w-6 h-6" /> Smart Scheduler
-        </h1>
-        <div className="flex gap-2 overflow-x-auto w-full md:w-auto pb-2 md:pb-0 hide-scrollbar">
-          {['dashboard', 'tasks', 'events', 'availability'].map(tab => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`capitalize px-4 py-2 rounded-md font-medium transition whitespace-nowrap ${
-                activeTab === tab ? 'bg-indigo-100 text-indigo-700' : 'text-slate-500 hover:bg-slate-100'
-              }`}
-            >
-              {tab}
-            </button>
-          ))}
-        </div>
-      </nav>
-
-      <main className="max-w-5xl mx-auto p-4 md:p-6 pb-24">
-        {/* Recommendation Modal */}
-        {targetTask && (
-          <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
-            <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
-              <h2 className="text-lg font-bold mb-4 flex items-center gap-2 text-indigo-900">
-                AI Scheduling: {targetTask.title}
-              </h2>
-
-              {aiLoading ? (
-                <div className="animate-pulse space-y-4">
-                  <div className="h-4 bg-slate-200 rounded w-3/4"></div>
-                  <div className="h-4 bg-slate-200 rounded w-1/2"></div>
-                  <div className="h-20 bg-slate-100 rounded mt-4"></div>
-                </div>
-              ) : recommendation && recommendation.recommendedStart ? (
-                <div className="space-y-4">
-                  <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-lg">
-                    <p className="font-semibold text-indigo-900 text-lg">
-                      {recommendation.recommendedStart.split('T')[0]}
-                    </p>
-                    <p className="font-bold text-indigo-600 text-xl">
-                      {recommendation.recommendedStart.split('T')[1]} - {recommendation.recommendedEnd.split('T')[1]}
-                    </p>
-                    <p className="text-sm text-indigo-800 mt-3">{recommendation.reason}</p>
-                    <div className="mt-3 inline-flex text-xs bg-white text-indigo-500 px-2 py-1 rounded border border-indigo-100">
-                      Source: {recommendation.source}
-                    </div>
-                  </div>
-                  <div className="flex gap-3 pt-2">
-                    <button onClick={acceptRecommendation} className="flex-1 bg-indigo-600 text-white py-2.5 rounded-lg font-medium hover:bg-indigo-700 transition">
-                      Accept Slot
-                    </button>
-                    <button onClick={() => { setTargetTask(null); setRecommendation(null); }} className="flex-1 bg-slate-100 text-slate-700 py-2.5 rounded-lg font-medium hover:bg-slate-200 transition">
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <div className="p-4 bg-red-50 text-red-700 rounded-lg border border-red-100">
-                    <AlertTriangle className="w-5 h-5 mb-2" />
-                    {recommendation?.reason || 'No available slots found for this task duration within your working hours.'}
-                  </div>
-                  <button onClick={() => { setTargetTask(null); setRecommendation(null); }} className="w-full bg-slate-100 text-slate-700 py-2.5 rounded-lg font-medium hover:bg-slate-200 transition">
-                    Close
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* DASHBOARD TAB */}
-        {activeTab === 'dashboard' && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-white p-6 rounded-xl border shadow-sm">
-                <h3 className="text-slate-500 font-medium mb-1">Pending Tasks</h3>
-                <p className="text-3xl font-bold text-slate-800">{pendingTasks.length}</p>
-              </div>
-              <div className="bg-white p-6 rounded-xl border shadow-sm">
-                <h3 className="text-slate-500 font-medium mb-1">Today's Events</h3>
-                <p className="text-3xl font-bold text-slate-800">{todayEvents.length}</p>
-              </div>
-              <div className="bg-white p-6 rounded-xl border shadow-sm">
-                <h3 className="text-slate-500 font-medium mb-1">Completed</h3>
-                <p className="text-3xl font-bold text-green-600">{completedTasks.length}</p>
-              </div>
-            </div>
-
-            <div className="grid md:grid-cols-2 gap-6">
-              {/* Needs Scheduling */}
-              <div className="bg-white p-6 rounded-xl border shadow-sm">
-                <h2 className="text-lg font-bold mb-4 flex items-center gap-2">
-                  <AlertTriangle className="w-5 h-5 text-orange-500" /> Unscheduled Tasks
-                </h2>
-                <div className="space-y-3">
-                  {pendingTasks.filter(t => !t.scheduledStart).map(task => (
-                    <div key={task.id} className="flex justify-between items-center p-3 border border-slate-100 bg-slate-50 rounded-lg hover:border-indigo-300 transition">
-                      <div>
-                        <p className="font-semibold text-slate-800">{task.title}</p>
-                        <p className="text-sm text-slate-500">{task.duration} mins • <span className={getPriorityColor(task.priority) + ' px-1.5 rounded text-xs'}>{task.priority}</span></p>
-                      </div>
-                      <button
-                        onClick={() => handleScheduleTask(task)}
-                        className="bg-indigo-100 text-indigo-700 px-3 py-1.5 rounded-md hover:bg-indigo-200 text-sm font-medium transition"
-                      >
-                        Auto-Schedule
-                      </button>
-                    </div>
-                  ))}
-                  {pendingTasks.filter(t => !t.scheduledStart).length === 0 && (
-                    <p className="text-slate-400 text-center py-6 text-sm">All tasks are scheduled!</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Scheduled Today */}
-              <div className="bg-white p-6 rounded-xl border shadow-sm">
-                <h2 className="text-lg font-bold mb-4 flex items-center gap-2">
-                  <Clock className="w-5 h-5 text-blue-500" /> Today's Schedule
-                </h2>
-                <div className="space-y-3 relative">
-                  {/* Events */}
-                  {todayEvents.map(event => (
-                    <div key={event.id} className="p-3 border-l-4 border-l-blue-500 bg-blue-50 rounded-r-lg">
-                      <p className="font-semibold text-blue-900">{event.title}</p>
-                      <p className="text-sm text-blue-700">{event.startTime} - {event.endTime}</p>
-                    </div>
-                  ))}
-                  {/* Scheduled Tasks */}
-                  {pendingTasks.filter(t => t.scheduledDate === todayStr).map(task => (
-                    <div key={task.id} className="p-3 border-l-4 border-l-indigo-500 bg-indigo-50 rounded-r-lg flex justify-between items-center">
-                      <div>
-                        <p className="font-semibold text-indigo-900">{task.title}</p>
-                        <p className="text-sm text-indigo-700">{task.scheduledStart} - {task.scheduledEnd}</p>
-                      </div>
-                      <button onClick={() => toggleTaskComplete(task.id)} className="text-indigo-600 hover:text-indigo-800" aria-label={`Complete ${task.title}`}>
-                        <CheckCircle className="w-6 h-6" />
-                      </button>
-                    </div>
-                  ))}
-                  {todayEvents.length === 0 && pendingTasks.filter(t => t.scheduledDate === todayStr).length === 0 && (
-                    <p className="text-slate-400 text-center py-6 text-sm">Nothing scheduled for today.</p>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TASKS TAB */}
-        {activeTab === 'tasks' && (
-          <div className="space-y-6">
-            <div className="bg-white p-6 rounded-xl border shadow-sm">
-              <h2 className="text-lg font-bold mb-4">Add New Task</h2>
-              <form onSubmit={addTask} className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-                <div className="md:col-span-2">
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Task Title</label>
-                  <input type="text" required value={newTask.title} onChange={e => setNewTask({ ...newTask, title: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Study for OS Midterm" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Duration (mins)</label>
-                  <input type="number" min="15" step="15" required value={newTask.duration} onChange={e => setNewTask({ ...newTask, duration: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Priority</label>
-                  <select value={newTask.priority} onChange={e => setNewTask({ ...newTask, priority: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none bg-white">
-                    <option>High</option><option>Medium</option><option>Low</option>
-                  </select>
-                </div>
-                <div className="md:col-span-4 flex justify-end">
-                  <button type="submit" className="bg-indigo-600 text-white px-6 py-2 rounded-md hover:bg-indigo-700 transition flex items-center gap-2 font-medium">
-                    <Plus className="w-4 h-4" /> Add Task
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            <div className="bg-white p-6 rounded-xl border shadow-sm">
-              <h2 className="text-lg font-bold mb-4">All Tasks</h2>
-              <div className="space-y-2">
-                {tasks.map(task => (
-                  <div key={task.id} className={`flex justify-between items-center p-4 border rounded-lg ${task.status === 'Completed' ? 'bg-slate-50 opacity-75' : 'bg-white'}`}>
-                    <div>
-                      <p className={`font-semibold ${task.status === 'Completed' ? 'line-through text-slate-500' : 'text-slate-800'}`}>{task.title}</p>
-                      <div className="flex items-center gap-3 text-sm text-slate-500 mt-1">
-                        <span>{task.duration} mins</span>
-                        <span className={getPriorityColor(task.priority) + ' px-1.5 rounded text-xs'}>{task.priority}</span>
-                        {task.scheduledStart && (
-                          <span className="text-indigo-600 flex items-center gap-1">
-                            <Clock className="w-3 h-3" /> {task.scheduledDate} ({task.scheduledStart})
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex gap-2">
-                      <button onClick={() => toggleTaskComplete(task.id)} className={`p-2 rounded-md ${task.status === 'Completed' ? 'text-green-600 bg-green-50' : 'text-slate-400 hover:bg-slate-100'}`} aria-label={`Toggle ${task.title} completion`}>
-                        <CheckCircle className="w-5 h-5" />
-                      </button>
-                      <button onClick={() => deleteTask(task.id)} className="p-2 rounded-md text-red-400 hover:bg-red-50 hover:text-red-600 transition" aria-label={`Delete ${task.title}`}>
-                        <Trash2 className="w-5 h-5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {tasks.length === 0 && <p className="text-slate-500 text-center py-4">No tasks added yet.</p>}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* EVENTS TAB */}
-        {activeTab === 'events' && (
-          <div className="space-y-6">
-            <div className="bg-white p-6 rounded-xl border shadow-sm">
-              <h2 className="text-lg font-bold mb-4">Add Fixed Event</h2>
-              <form onSubmit={addEvent} className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Event Title</label>
-                  <input type="text" required value={newEvent.title} onChange={e => setNewEvent({ ...newEvent, title: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Physics Lecture" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Date</label>
-                  <input type="date" required value={newEvent.date} onChange={e => setNewEvent({ ...newEvent, date: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">Start Time</label>
-                  <input type="time" required value={newEvent.startTime} onChange={e => setNewEvent({ ...newEvent, startTime: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-1">End Time</label>
-                  <input type="time" required value={newEvent.endTime} onChange={e => setNewEvent({ ...newEvent, endTime: e.target.value })} className="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 outline-none" />
-                </div>
-                <div className="md:col-span-4 flex justify-end">
-                  <button type="submit" className="bg-blue-600 text-white px-6 py-2 rounded-md hover:bg-blue-700 transition flex items-center gap-2 font-medium">
-                    <Plus className="w-4 h-4" /> Add Event
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            <div className="bg-white p-6 rounded-xl border shadow-sm">
-              <h2 className="text-lg font-bold mb-4">All Fixed Events</h2>
-              <div className="space-y-2">
-                {[...events].sort((a, b) => new Date(a.date) - new Date(b.date)).map(event => (
-                  <div key={event.id} className="flex justify-between items-center p-4 border rounded-lg bg-white">
-                    <div>
-                      <p className="font-semibold text-slate-800">{event.title}</p>
-                      <div className="flex items-center gap-3 text-sm text-slate-500 mt-1">
-                        <span><Calendar className="w-3 h-3 inline mr-1" />{event.date}</span>
-                        <span><Clock className="w-3 h-3 inline mr-1" />{event.startTime} - {event.endTime}</span>
-                      </div>
-                    </div>
-                    <button onClick={() => deleteEvent(event.id)} className="p-2 rounded-md text-red-400 hover:bg-red-50 hover:text-red-600 transition" aria-label={`Delete ${event.title}`}>
-                      <Trash2 className="w-5 h-5" />
-                    </button>
-                  </div>
-                ))}
-                {events.length === 0 && <p className="text-slate-500 text-center py-4">No events added yet.</p>}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* AVAILABILITY TAB */}
-        {activeTab === 'availability' && (
-          <div className="bg-white p-6 rounded-xl border shadow-sm max-w-2xl">
-            <h2 className="text-lg font-bold mb-4">Working Hours (Availability)</h2>
-            <p className="text-sm text-slate-500 mb-6">Define the time blocks where the AI is allowed to schedule tasks for you.</p>
-
-            <div className="space-y-4">
-              {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map(day => (
-                <div key={day} className="flex items-center gap-4">
-                  <div className="w-24 font-medium text-slate-700">{day}</div>
-                  {availability[day] && availability[day].length > 0 ? (
-                    <div className="flex gap-2 items-center flex-1">
-                      <input
-                        type="time"
-                        value={availability[day][0].start}
-                        onChange={(e) => setAvailability({ ...availability, [day]: [{ ...availability[day][0], start: e.target.value }] })}
-                        className="p-2 border rounded-md outline-none focus:ring-1 focus:ring-indigo-500 text-sm"
-                      />
-                      <span className="text-slate-400">to</span>
-                      <input
-                        type="time"
-                        value={availability[day][0].end}
-                        onChange={(e) => setAvailability({ ...availability, [day]: [{ ...availability[day][0], end: e.target.value }] })}
-                        className="p-2 border rounded-md outline-none focus:ring-1 focus:ring-indigo-500 text-sm"
-                      />
-                      <button
-                        onClick={() => setAvailability({ ...availability, [day]: [] })}
-                        className="ml-auto text-xs text-red-500 hover:bg-red-50 px-2 py-1 rounded"
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex-1 flex justify-between items-center bg-slate-50 p-2 rounded-md border border-dashed border-slate-200">
-                      <span className="text-sm text-slate-400 italic">No availability</span>
-                      <button
-                        onClick={() => setAvailability({ ...availability, [day]: [{ start: '09:00', end: '17:00' }] })}
-                        className="text-xs bg-white border shadow-sm px-3 py-1 rounded text-slate-600 hover:bg-slate-50"
-                      >
-                        Add Hours
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </main>
-    </div>
-  );
+  return <div className="min-h-screen bg-slate-50 pb-12"><nav className="border-b bg-white p-4"><div className="mx-auto flex max-w-5xl flex-col items-center justify-between gap-3 md:flex-row"><h1 className="flex items-center gap-2 text-xl font-bold text-indigo-700"><CalendarDays />Smart Scheduler</h1><div className="flex gap-1 overflow-x-auto">{['dashboard', 'tasks', 'events', 'availability', 'completed'].map(item => <button key={item} onClick={() => setTab(item)} className={`whitespace-nowrap rounded px-3 py-2 text-sm capitalize ${tab === item ? 'bg-indigo-600 text-white' : 'hover:bg-slate-100'}`}>{item === 'completed' ? 'Completed Tasks' : item}</button>)}</div></div></nav>{notice && <div role="status" className="fixed right-4 top-20 z-40 rounded border bg-white px-4 py-3 text-sm shadow">{notice}</div>}<main className="mx-auto max-w-5xl space-y-6 p-4 md:p-6">{dialog === 'add' && <Dialog title="Add this task?" close={() => setDialog(null)}><p className="mb-4 text-sm">{taskForm.title} | {taskForm.duration} minutes | {taskForm.priority} | Due {taskForm.deadline}</p><button onClick={confirmTask} className="mr-2 rounded bg-indigo-600 px-4 py-2 text-white">Confirm &amp; Add</button><button onClick={() => setDialog(null)} className="rounded bg-slate-100 px-4 py-2">Go Back</button></Dialog>}{dialog?.type === 'complete' && <Dialog title="Have you completed this task?" close={() => setDialog(null)}><p className="mb-4 text-sm">{dialog.task.title} will move to history.</p><button onClick={completeTask} className="mr-2 rounded bg-green-600 px-4 py-2 text-white">Yes, Complete Task</button><button onClick={() => setDialog(null)} className="rounded bg-slate-100 px-4 py-2">Cancel</button></Dialog>}{dialog === 'reschedule' && <Dialog title="Reschedule overdue tasks?" close={() => setDialog(null)}><p className="mb-4 text-sm">{overdue.length} active task(s) will use today's free time.</p><button onClick={reschedule} className="mr-2 rounded bg-orange-600 px-4 py-2 text-white">Reschedule to Today</button><button onClick={() => setDialog(null)} className="rounded bg-slate-100 px-4 py-2">Cancel</button></Dialog>}{target && <Dialog title={`Schedule ${target.title}`} close={() => setTarget(null)}>{loading ? <p>Finding a valid slot...</p> : recommendation?.recommendedStart ? <><p className="rounded bg-indigo-50 p-4 text-sm">{recommendation.recommendedStart.replace('T', ' at ')} - {recommendation.recommendedEnd.split('T')[1]}<br />{recommendation.reason}<br />Source: {recommendation.source}</p><button onClick={acceptSchedule} className="mt-3 rounded bg-indigo-600 px-4 py-2 text-white">Accept Slot</button></> : <p className="rounded bg-red-50 p-4 text-sm text-red-700">{recommendation?.reason || 'No suitable slot found.'}</p>}</Dialog>}{content}</main></div>;
 }

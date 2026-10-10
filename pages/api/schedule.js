@@ -1,4 +1,4 @@
-import { findDeterministicSlot } from '../../utils/scheduler';
+import { findDeterministicSlot, timeToMins } from '../../utils/scheduler';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -7,7 +7,7 @@ export default async function handler(req, res) {
 
   const { task, availableSlots, existingEvents, existingTasks } = req.body;
 
-  if (!task || !Array.isArray(availableSlots)) {
+  if (!task || !Array.isArray(availableSlots) || !task.title?.trim() || Number(task.duration) <= 0) {
     return res.status(400).json({ error: 'Invalid payload' });
   }
 
@@ -69,6 +69,12 @@ Respond in pure JSON matching exactly this format:
 
     const data = await response.json();
     const parsed = JSON.parse(data.candidates[0].content.parts[0].text);
+    const candidate = availableSlots.find(slot =>
+      `${slot.date}T${slot.start}` === parsed.recommendedStart
+      && timeToMins(parsed.recommendedEnd?.split('T')[1]) - timeToMins(slot.start) >= Number(task.duration)
+      && timeToMins(parsed.recommendedEnd?.split('T')[1]) <= timeToMins(slot.end)
+    );
+    if (!candidate) throw new Error('Gemini returned a slot outside the valid candidates.');
 
     return res.status(200).json({ ...parsed, source: 'gemini' });
   } catch (error) {

@@ -1,90 +1,89 @@
-// Convert "HH:mm" to minutes since midnight for easy math
+export const getLocalDateStr = (dateObj = new Date()) => {
+  const year = dateObj.getFullYear();
+  const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const day = String(dateObj.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
 export const timeToMins = (time) => {
-  if (!time) return 0;
-  const [h, m] = time.split(':').map(Number);
-  return h * 60 + m;
+  if (!time || !/^\d{2}:\d{2}$/.test(time)) return NaN;
+  const [hours, minutes] = time.split(':').map(Number);
+  return hours * 60 + minutes;
 };
 
-// Convert minutes back to "HH:mm"
 export const minsToTime = (mins) => {
-  const h = Math.floor(mins / 60).toString().padStart(2, '0');
-  const m = (mins % 60).toString().padStart(2, '0');
-  return `${h}:${m}`;
+  const hours = Math.floor(mins / 60).toString().padStart(2, '0');
+  const minutes = (mins % 60).toString().padStart(2, '0');
+  return `${hours}:${minutes}`;
 };
 
-// Check if two time ranges overlap
-export const isOverlap = (start1, end1, start2, end2) => {
-  return start1 < end2 && end1 > start2;
+export const isOverlap = (start1, end1, start2, end2) => start1 < end2 && end1 > start2;
+
+export const validateAvailabilityWindows = (windows = []) => {
+  const sorted = [...windows].sort((a, b) => timeToMins(a.start) - timeToMins(b.start));
+  for (const window of sorted) {
+    const start = timeToMins(window.start);
+    const end = timeToMins(window.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+      return { valid: false, error: 'Each start time must be before its end time.' };
+    }
+  }
+  for (let index = 1; index < sorted.length; index += 1) {
+    if (timeToMins(sorted[index - 1].end) > timeToMins(sorted[index].start)) {
+      return { valid: false, error: 'Availability windows cannot overlap.' };
+    }
+  }
+  return { valid: true };
 };
 
-// Generate truly available gaps for a specific date
-export const calculateFreeSlots = (dateStr, duration, availability, events, tasks) => {
-  const dateObj = new Date(dateStr);
+export const calculateFreeSlots = (dateStr, duration, availability = {}, events = [], tasks = []) => {
+  const dateObj = new Date(`${dateStr}T12:00:00`);
   const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'long' });
-  
+  const numericDuration = Number(duration);
+  if (!Number.isFinite(numericDuration) || numericDuration <= 0) return [];
+
   const dayAvail = availability[dayName] || [];
-  if (dayAvail.length === 0) return [];
-
-  // Gather all existing commitments for this specific date
   const bookedToday = [
-    ...events
-      .filter(e => e.date === dateStr)
-      .map(e => ({ start: timeToMins(e.startTime), end: timeToMins(e.endTime) })),
-    ...tasks
-      .filter(t => t.scheduledDate === dateStr && t.status !== 'Missed')
-      .map(t => ({ start: timeToMins(t.scheduledStart), end: timeToMins(t.scheduledEnd) }))
-  ];
+    ...events.filter(event => event.date === dateStr).map(event => ({
+      start: timeToMins(event.startTime), end: timeToMins(event.endTime)
+    })),
+    ...tasks.filter(task => task.scheduledDate === dateStr && task.status === 'Pending').map(task => ({
+      start: timeToMins(task.scheduledStart), end: timeToMins(task.scheduledEnd)
+    }))
+  ].filter(booking => Number.isFinite(booking.start) && Number.isFinite(booking.end));
 
-  let freeSlots = [];
-  
+  const freeSlots = [];
   dayAvail.forEach(window => {
-    let windowStart = timeToMins(window.start);
+    const windowStart = timeToMins(window.start);
     const windowEnd = timeToMins(window.end);
-    
-    // Sort bookings chronologically to process gaps
-    const overlappingBookings = bookedToday
-      .filter(b => isOverlap(windowStart, windowEnd, b.start, b.end))
+    if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd) || windowStart >= windowEnd) return;
+    let cursor = windowStart;
+    const bookings = bookedToday
+      .filter(booking => isOverlap(windowStart, windowEnd, booking.start, booking.end))
       .sort((a, b) => a.start - b.start);
 
-    overlappingBookings.forEach(booking => {
-      // Is there a large enough gap BEFORE this booking?
-      if (booking.start - windowStart >= duration) {
-        freeSlots.push({ 
-          start: minsToTime(windowStart), 
-          end: minsToTime(booking.start), 
-          date: dateStr 
-        });
+    bookings.forEach(booking => {
+      const bookingStart = Math.max(windowStart, booking.start);
+      if (bookingStart - cursor >= numericDuration) {
+        freeSlots.push({ start: minsToTime(cursor), end: minsToTime(bookingStart), date: dateStr });
       }
-      // Move our scanner to the end of the current booking
-      windowStart = Math.max(windowStart, booking.end);
+      cursor = Math.max(cursor, booking.end);
     });
-
-    // Is there a gap AFTER all bookings until the end of the availability window?
-    if (windowEnd - windowStart >= duration) {
-      freeSlots.push({ 
-        start: minsToTime(windowStart), 
-        end: minsToTime(windowEnd), 
-        date: dateStr 
-      });
+    if (windowEnd - cursor >= numericDuration) {
+      freeSlots.push({ start: minsToTime(cursor), end: minsToTime(windowEnd), date: dateStr });
     }
   });
-
   return freeSlots;
 };
 
-// Fallback algorithm if AI fails or key is missing
-export const findDeterministicSlot = (task, availableSlots) => {
-  if (!availableSlots || availableSlots.length === 0) return null;
-  
-  // Simply pick the earliest valid slot found
-  const slot = availableSlots[0]; 
-  const startMins = timeToMins(slot.start);
-  const endMins = startMins + Number(task.duration);
-  
+export const findDeterministicSlot = (task, availableSlots = []) => {
+  const duration = Number(task?.duration);
+  const slot = availableSlots.find(candidate => timeToMins(candidate.end) - timeToMins(candidate.start) >= duration);
+  if (!slot || !Number.isFinite(duration) || duration <= 0) return null;
   return {
     recommendedStart: `${slot.date}T${slot.start}`,
-    recommendedEnd: `${slot.date}T${minsToTime(endMins)}`,
-    reason: 'First available slot selected by local algorithmic fallback.',
+    recommendedEnd: `${slot.date}T${minsToTime(timeToMins(slot.start) + duration)}`,
+    reason: 'First valid slot selected by the local scheduler.',
     confidence: 'high'
   };
 };
